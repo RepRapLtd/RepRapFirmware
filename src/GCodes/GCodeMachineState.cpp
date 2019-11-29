@@ -12,8 +12,10 @@ unsigned int GCodeMachineState::numAllocated = 0;
 
 // Create a default initialised GCodeMachineState
 GCodeMachineState::GCodeMachineState()
-	: previous(nullptr), feedrate(DefaultFeedrate * SecondsToMinutes), fileState(), lockedResources(0), state(GCodeState::normal),
-	  drivesRelative(false), axesRelative(false), doingFileMacro(false), runningM502(false)
+	: previous(nullptr), feedRate(DefaultFeedRate * SecondsToMinutes), fileState(), lockedResources(0), errorMessage(nullptr), state(GCodeState::normal),
+	  drivesRelative(false), axesRelative(false), doingFileMacro(false), runningM501(false), runningM502(false),
+	  volumetricExtrusion(false), g53Active(false), runningSystemMacro(false), usingInches(false),
+	  waitingForAcknowledgement(false), messageAcknowledged(false)
 {
 }
 
@@ -25,6 +27,7 @@ GCodeMachineState::GCodeMachineState()
 	{
 		freeList = ms->previous;
 		ms->lockedResources = 0;
+		ms->errorMessage = nullptr;
 		ms->state = GCodeState::normal;
 	}
 	else

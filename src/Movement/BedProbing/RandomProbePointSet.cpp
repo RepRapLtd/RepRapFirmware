@@ -9,6 +9,25 @@
 #include "RepRap.h"
 #include "Platform.h"
 
+#if SUPPORT_OBJECT_MODEL
+
+// Object model table and functions
+// Note: if using GCC version 7.3.1 20180622 and lambda functions are used in this table, you must compile this file with option -std=gnu++17.
+// Otherwise the table will be allocated in RAM instead of flash, which wastes too much RAM.
+
+// Macro to build a standard lambda function that includes the necessary type conversions
+#define OBJECT_MODEL_FUNC(_ret) OBJECT_MODEL_FUNC_BODY(RandomProbePointSet, _ret)
+
+const ObjectModelTableEntry RandomProbePointSet::objectModelTable[] =
+{
+	// These entries must be in alphabetical order
+	{ "numPointsProbed", OBJECT_MODEL_FUNC(&(self->numBedCompensationPoints)), TYPE_OF(uint32_t), ObjectModelTableEntry::none }
+};
+
+DEFINE_GET_OBJECT_MODEL_TABLE(RandomProbePointSet)
+
+#endif
+
 RandomProbePointSet::RandomProbePointSet() : numBedCompensationPoints(0)
 {
 	for (size_t point = 0; point < MaxProbePoints; point++)
@@ -72,89 +91,92 @@ void RandomProbePointSet::ClearProbeHeights()
 	}
 }
 
-void RandomProbePointSet::SetProbedBedEquation(size_t numPoints, StringRef& reply)
+// Set the bed transform, returning true if error
+bool RandomProbePointSet::SetProbedBedEquation(size_t numPoints, const StringRef& reply)
 {
 	if (!GoodProbePointOrdering(numPoints))
 	{
-		reply.printf("Error: probe points P0 to P%u must be in clockwise order starting near X=0 Y=0", min<unsigned int>(numPoints, 4) - 1);
+		reply.printf("Probe points P0 to P%u must be in clockwise order starting near minimum X and Y", min<unsigned int>(numPoints, 4) - 1);
 		if (numPoints >= 5)
 		{
-			reply.cat(" and P4 must be near the centre");
+			reply.cat(", and P4 must be near the centre");
 		}
+		return true;
 	}
-	else
+
+	switch(numPoints)
 	{
-		switch(numPoints)
+	case 3:
+		/*
+		 * Transform to a plane
+		 */
 		{
-		case 3:
-			/*
-			 * Transform to a plane
-			 */
-			{
-				const float x10 = xBedProbePoints[1] - xBedProbePoints[0];
-				const float y10 = yBedProbePoints[1] - yBedProbePoints[0];
-				const float z10 = zBedProbePoints[1] - zBedProbePoints[0];
-				const float x20 = xBedProbePoints[2] - xBedProbePoints[0];
-				const float y20 = yBedProbePoints[2] - yBedProbePoints[0];
-				const float z20 = zBedProbePoints[2] - zBedProbePoints[0];
-				const float a = y10 * z20 - z10 * y20;
-				const float b = z10 * x20 - x10 * z20;
-				const float c = x10 * y20 - y10 * x20;
-				const float d = -(xBedProbePoints[1] * a + yBedProbePoints[1] * b + zBedProbePoints[1] * c);
-				aX = -a / c;
-				aY = -b / c;
-				aC = -d / c;
-			}
-			break;
-
-		case 4:
-			/*
-			 * Transform to a ruled-surface quadratic.  The corner points for interpolation are indexed:
-			 *
-			 *   ^  [1]      [2]
-			 *   |
-			 *   Y
-			 *   |
-			 *   |  [0]      [3]
-			 *      -----X---->
-			 *
-			 *   These are the scaling factors to apply to x and y coordinates to get them into the
-			 *   unit interval [0, 1].
-			 */
-			xRectangle = 1.0 / (xBedProbePoints[3] - xBedProbePoints[0]);
-			yRectangle = 1.0 / (yBedProbePoints[1] - yBedProbePoints[0]);
-			break;
-
-		case 5:
-			for (size_t i = 0; i < 4; i++)
-			{
-				const float x10 = xBedProbePoints[i] - xBedProbePoints[4];
-				const float y10 = yBedProbePoints[i] - yBedProbePoints[4];
-				const float z10 = zBedProbePoints[i] - zBedProbePoints[4];
-				baryXBedProbePoints[i] = xBedProbePoints[4] + 2.0 * x10;
-				baryYBedProbePoints[i] = yBedProbePoints[4] + 2.0 * y10;
-				baryZBedProbePoints[i] = zBedProbePoints[4] + 2.0 * z10;
-			}
-			baryXBedProbePoints[4] = xBedProbePoints[4];
-			baryYBedProbePoints[4] = yBedProbePoints[4];
-			baryZBedProbePoints[4] = zBedProbePoints[4];
-			break;
-
-		default:
-			reprap.GetPlatform().MessageF(GENERIC_MESSAGE, "Bed calibration error: %d points provided but only 3, 4 and 5 supported\n", numPoints);
-			return;
+			const float x10 = xBedProbePoints[1] - xBedProbePoints[0];
+			const float y10 = yBedProbePoints[1] - yBedProbePoints[0];
+			const float z10 = zBedProbePoints[1] - zBedProbePoints[0];
+			const float x20 = xBedProbePoints[2] - xBedProbePoints[0];
+			const float y20 = yBedProbePoints[2] - yBedProbePoints[0];
+			const float z20 = zBedProbePoints[2] - zBedProbePoints[0];
+			const float a = y10 * z20 - z10 * y20;
+			const float b = z10 * x20 - x10 * z20;
+			const float c = x10 * y20 - y10 * x20;
+			const float d = -(xBedProbePoints[1] * a + yBedProbePoints[1] * b + zBedProbePoints[1] * c);
+			aX = -a / c;
+			aY = -b / c;
+			aC = -d / c;
 		}
+		break;
 
-		numBedCompensationPoints = numPoints;
+	case 4:
+		/*
+		 * Transform to a ruled-surface quadratic.  The corner points for interpolation are indexed:
+		 *
+		 *   ^  [1]      [2]
+		 *   |
+		 *   Y
+		 *   |
+		 *   |  [0]      [3]
+		 *      -----X---->
+		 *
+		 *   These are the scaling factors to apply to x and y coordinates to get them into the
+		 *   unit interval [0, 1].
+		 */
+		xRectangle = 1.0 / (xBedProbePoints[3] - xBedProbePoints[0]);
+		yRectangle = 1.0 / (yBedProbePoints[1] - yBedProbePoints[0]);
+		break;
 
-		// Report what points the bed equation fits
-		reply.copy("Bed equation fits points");
-		for (size_t point = 0; point < numPoints; point++)
+	case 5:
+		for (size_t i = 0; i < 4; i++)
 		{
-			reply.catf(" [%.1f, %.1f, %.3f]", xBedProbePoints[point], yBedProbePoints[point], zBedProbePoints[point]);
+			const float x10 = xBedProbePoints[i] - xBedProbePoints[4];
+			const float y10 = yBedProbePoints[i] - yBedProbePoints[4];
+			const float z10 = zBedProbePoints[i] - zBedProbePoints[4];
+			baryXBedProbePoints[i] = xBedProbePoints[4] + 2.0 * x10;
+			baryYBedProbePoints[i] = yBedProbePoints[4] + 2.0 * y10;
+			baryZBedProbePoints[i] = zBedProbePoints[4] + 2.0 * z10;
 		}
+		baryXBedProbePoints[4] = xBedProbePoints[4];
+		baryYBedProbePoints[4] = yBedProbePoints[4];
+		baryZBedProbePoints[4] = zBedProbePoints[4];
+		break;
+
+	default:
+		reply.printf("Bed calibration: %d points provided but only 3, 4 and 5 supported", numPoints);
+		return true;
 	}
-	reply.cat("\n");
+
+	numBedCompensationPoints = numPoints;
+
+	reprap.GetPlatform().Message(WarningMessage,
+		"3/4/5-point bed compensation is deprecated and will be removed in a future firmware release. Please use G29 mesh bed compensation instead.\n");
+
+	// Report what points the bed equation fits
+	reply.copy("Bed equation fits points");
+	for (size_t point = 0; point < numPoints; point++)
+	{
+		reply.catf(" [%.1f, %.1f, %.3f]", (double)xBedProbePoints[point], (double)yBedProbePoints[point], (double)zBedProbePoints[point]);
+	}
+	return false;
 }
 
 // Compute the interpolated height error at the specified point
@@ -164,7 +186,7 @@ float RandomProbePointSet::GetInterpolatedHeightError(float x, float y) const
 	{
 	case 0:
 	default:
-		return 0;
+		return 0.0;
 
 	case 3:
 		return aX * x + aY * y + aC;
@@ -227,9 +249,9 @@ bool RandomProbePointSet::GoodProbePointOrdering(size_t numPoints) const
 }
 
 // Print out the probe heights and any errors
-void RandomProbePointSet::ReportProbeHeights(size_t numPoints, StringRef& reply) const
+void RandomProbePointSet::ReportProbeHeights(size_t numPoints, const StringRef& reply) const
 {
-	reply.copy("Bed probe heights:");
+	reply.copy("G32 bed probe heights:");
 	float sum = 0.0;
 	float sumOfSquares = 0.0;
 	for (size_t i = 0; i < numPoints; ++i)
@@ -244,13 +266,15 @@ void RandomProbePointSet::ReportProbeHeights(size_t numPoints, StringRef& reply)
 		}
 		else
 		{
-			reply.catf(" %.3f", zBedProbePoints[i]);
+			reply.catf(" %.3f", (double)zBedProbePoints[i]);
 			sum += zBedProbePoints[i];
 			sumOfSquares += fsquare(zBedProbePoints[i]);
 		}
 	}
 	const float mean = sum/numPoints;
-	reply.catf(", mean %.3f, deviation from mean %.3f", mean, sqrt(sumOfSquares/numPoints - fsquare(mean)));
+	// In the following, if there is only 1 point we may try to take the square root of a negative number due to rounding error, hence the 'max' call
+	const float stdDev = sqrtf(max<float>(sumOfSquares/numPoints - fsquare(mean), 0.0));
+	reply.catf(", mean %.3f, deviation from mean %.3f", (double)mean, (double)stdDev);
 }
 
 /*
@@ -295,7 +319,7 @@ float RandomProbePointSet::TriangleZ(float x, float y) const
 			return l1 * baryZBedProbePoints[i] + l2 * baryZBedProbePoints[j] + l3 * baryZBedProbePoints[4];
 		}
 	}
-	reprap.GetPlatform().Message(GENERIC_MESSAGE, "Triangle interpolation: point outside all triangles!\n");
+	reprap.GetPlatform().Message(WarningMessage, "Triangle interpolation: point outside all triangles!\n");
 	return 0.0;
 }
 
@@ -320,12 +344,12 @@ void RandomProbePointSet::DebugPrint(size_t numPoints) const
 	float sumOfSquares = 0.0;
 	for (size_t i = 0; i < numPoints; ++i)
 	{
-		debugPrintf(" %.3f", zBedProbePoints[i]);
+		debugPrintf(" %.3f", (double)zBedProbePoints[i]);
 		sum += zBedProbePoints[i];
 		sumOfSquares += fsquare(zBedProbePoints[i]);
 	}
 	const float mean = sum/numPoints;
-	debugPrintf(", mean %.3f, deviation from mean %.3f\n", mean, sqrt(sumOfSquares/numPoints - fsquare(mean)));
+	debugPrintf(", mean %.3f, deviation from mean %.3f\n", (double)mean, (double)sqrtf(sumOfSquares/numPoints - fsquare(mean)));
 }
 
 // End

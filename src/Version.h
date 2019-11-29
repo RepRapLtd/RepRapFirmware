@@ -8,14 +8,21 @@
 #ifndef SRC_VERSION_H_
 #define SRC_VERSION_H_
 
+
 #ifndef VERSION
-# define VERSION "1.19beta1"
+#ifdef RTOS
+# define MAIN_VERSION	"2.04+1"
+#else
+# define MAIN_VERSION	"1.25+1"
+#endif
+
+# define VERSION MAIN_VERSION
 #endif
 
 #ifndef DATE
-# define DATE "2017-05-21"
+# define DATE "2019-11-28b1"
 #endif
 
-#define AUTHORS "reprappro, dc42, chrishamm, t3p3, dnewman"
+#define AUTHORS "reprappro, dc42, chrishamm, t3p3, dnewman, printm3d"
 
 #endif /* SRC_VERSION_H_ */

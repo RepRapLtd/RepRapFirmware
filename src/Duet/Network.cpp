@@ -46,11 +46,14 @@
 #include "RepRap.h"
 #include "Webserver.h"
 #include "Version.h"
+#include "General/IP4String.h"
+
+#include "ethernet_sam.h"
+
+#define SUPPORT_MDNS	0	// LWIP v1 MDNS responder code is buggy, it tries to allocate PBUFs and assumes that allocation always succeeds
 
 extern "C"
 {
-#include "ethernet_sam.h"
-
 #include "lwipopts.h"
 
 #ifdef LWIP_STATS
@@ -61,7 +64,10 @@ extern "C"
 #include "lwip/src/include/lwip/tcp_impl.h"
 
 #include "contrib/apps/netbios/netbios.h"
-#include "contrib/apps/mdns/mdns_responder.h"
+
+#if SUPPORT_MDNS
+# include "contrib/apps/mdns/mdns_responder.h"
+#endif
 }
 
 static volatile bool lwipLocked = false;
@@ -71,12 +77,17 @@ const size_t NumProtocols = 3;																		// number of network protocols w
 const size_t HttpProtocolIndex = 0, FtpProtocolIndex = 1, TelnetProtocolIndex = 2;					// index of theHTTP service above
 const Port DefaultPortNumbers[NumProtocols] = { DefaultHttpPort, DefaultFtpPort, DefaultTelnetPort };
 const char * const ProtocolNames[NumProtocols] = { "HTTP", "FTP", "TELNET" };
+
+#if SUPPORT_MDNS
 const char * const MdnsServiceStrings[NumProtocols] = { "\x05_http\x04_tcp\x05local", "\x04_ftp\x04_tcp\x05local", "\x07_telnet\x04_tcp\x05local" };
+#endif
 
 static Port portNumbers[NumProtocols] = { DefaultHttpPort, DefaultFtpPort, DefaultTelnetPort };		// port number used for each protocol
 static bool protocolEnabled[NumProtocols] = { true, false, false };									// by default only HTTP is enabled
 static tcp_pcb *pcbs[NumProtocols] = { nullptr, nullptr, nullptr };
 static tcp_pcb *ftp_pasv_pcb = nullptr;
+
+#if SUPPORT_MDNS
 
 const size_t NumMdnsFixedProtocols = 1;			// what we need to add to the protocol index in order to access the corresponding entry in mdns_services
 static struct mdns_service mdns_services[NumMdnsFixedProtocols + NumProtocols] =
@@ -103,6 +114,8 @@ static const char *mdns_txt_records[] =
 	"version=" VERSION,
 	NULL
 };
+
+#endif
 
 static bool closingDataPort = false;
 
@@ -159,8 +172,11 @@ static void ethernet_rx_callback(uint32_t ul_status)
 
 static void conn_err(void *arg, err_t err)
 {
-	// Report the error to the monitor
-	reprap.GetPlatform().MessageF(HOST_MESSAGE, "Network: Connection error, code %d\n", err);
+	if (reprap.Debug(moduleNetwork) && !inInterrupt())
+	{
+		// Report the error to the monitor
+		reprap.GetPlatform().MessageF(UsbMessage, "Network: Connection error, code %d\n", err);
+	}
 
 	// Tell the higher levels about the error
 	ConnectionState *cs = (ConnectionState*)arg;
@@ -178,7 +194,10 @@ static err_t conn_recv(void *arg, tcp_pcb *pcb, pbuf *p, err_t err)
 	{
 		if (cs->pcb != pcb)
 		{
-			reprap.GetPlatform().Message(HOST_MESSAGE, "Network: Mismatched pcb in conn_recv!\n");
+			if (reprap.Debug(moduleNetwork) && !inInterrupt())
+			{
+				reprap.GetPlatform().Message(UsbMessage, "Network: Mismatched pcb in conn_recv!\n");
+			}
 			tcp_abort(pcb);
 			return ERR_ABRT;
 		}
@@ -277,11 +296,12 @@ void Network::Init()
 		freeConnections = cs;
 	}
 
-	strcpy(hostname, HOSTNAME);
+	strcpy(hostname, DEFAULT_HOSTNAME);
+	memcpy(macAddress, platform.GetDefaultMacAddress(), sizeof(macAddress));
 
 	webserver = new Webserver(&platform, this);
 	webserver->Init();
-	longWait = platform.Time();
+	longWait = millis();
 }
 
 void Network::Exit()
@@ -289,11 +309,12 @@ void Network::Exit()
 	webserver->Exit();
 }
 
-void Network::EnableProtocol(int protocol, int port, int secure, StringRef& reply)
+GCodeResult Network::EnableProtocol(unsigned int interface, int protocol, int port, int secure, const StringRef& reply)
 {
 	if (secure != 0 && secure != -1)
 	{
-		reply.copy("Error: this firmware does not support TLS");
+		reply.copy("this firmware does not support TLS");
+		return GCodeResult::error;
 	}
 	else if (protocol >= 0 && protocol < (int)NumProtocols)
 	{
@@ -319,21 +340,23 @@ void Network::EnableProtocol(int protocol, int port, int secure, StringRef& repl
 	else
 	{
 		reply.copy("Invalid protocol parameter");
+		return GCodeResult::error;
 	}
+	return GCodeResult::ok;
 }
 
-void Network::DisableProtocol(int protocol, StringRef& reply)
+GCodeResult Network::DisableProtocol(unsigned int interface, int protocol, const StringRef& reply)
 {
 	if (protocol >= 0 && protocol < (int)NumProtocols)
 	{
 		ShutdownProtocol(protocol);
 		protocolEnabled[protocol] = false;
 		ReportOneProtocol(protocol, reply);
+		return GCodeResult::ok;
 	}
-	else
-	{
-		reply.copy("Invalid protocol parameter");
-	}
+
+	reply.copy("Invalid protocol parameter");
+	return GCodeResult::error;
 }
 
 void Network::StartProtocol(size_t protocol)
@@ -357,7 +380,7 @@ void Network::ShutdownProtocol(size_t protocol)
 }
 
 // Report the protocols and ports in use
-void Network::ReportProtocols(StringRef& reply) const
+GCodeResult Network::ReportProtocols(unsigned int interface, const StringRef& reply) const
 {
 	reply.Clear();
 	for (size_t i = 0; i < NumProtocols; ++i)
@@ -368,9 +391,10 @@ void Network::ReportProtocols(StringRef& reply) const
 		}
 		ReportOneProtocol(i, reply);
 	}
+	return GCodeResult::ok;
 }
 
-void Network::ReportOneProtocol(size_t protocol, StringRef& reply) const
+void Network::ReportOneProtocol(size_t protocol, const StringRef& reply) const
 {
 	if (protocolEnabled[protocol])
 	{
@@ -384,6 +408,7 @@ void Network::ReportOneProtocol(size_t protocol, StringRef& reply) const
 
 void Network::DoMdnsAnnounce()
 {
+#if SUPPORT_MDNS
 	// Fill in the table of services
 	size_t numServices = NumMdnsFixedProtocols;
 	for (size_t i = 0; i < NumProtocols; ++i)
@@ -399,6 +424,7 @@ void Network::DoMdnsAnnounce()
 	// We have patched mdns_responder_init so that it can be called more than once
 	mdns_responder_init(mdns_services, numServices, mdns_txt_records);
 	mdns_announce();
+#endif
 }
 
 void Network::Spin(bool full)
@@ -415,8 +441,7 @@ void Network::Spin(bool full)
 					state = NetworkEstablishingLink;
 					UnlockLWIP();
 
-					platform.Message(HOST_MESSAGE, "Network down\n");
-					platform.ClassReport(longWait);
+					platform.Message(UsbMessage, "Network down\n");
 					return;
 				}
 
@@ -450,36 +475,37 @@ void Network::Spin(bool full)
 						DoMdnsAnnounce();
 
 						UnlockLWIP();
-						platform.MessageF(HOST_MESSAGE, "Network up, IP=%d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
-						platform.ClassReport(longWait);
+						platform.MessageF(UsbMessage, "Network up, IP=%s\n", IP4String(ip).c_str());
 						return;
 					}
 				}
-
-				NetworkTransaction *transaction = writingTransactions;
-				if (transaction != nullptr && sendingConnection == nullptr)
+				else if (state == NetworkActive)
 				{
-					if (transaction->next != nullptr)
+					NetworkTransaction *transaction = writingTransactions;
+					if (transaction != nullptr && sendingConnection == nullptr)
 					{
-						// Data is supposed to be sent and the last packet has been acknowledged.
-						// Rotate the transactions so every client is served even while multiple files are sent
-						NetworkTransaction *next = transaction->next;
-						writingTransactions = next;
-						AppendTransaction(&writingTransactions, transaction);
-						transaction = next;
-					}
-
-					if (transaction->Send())
-					{
-						// This transaction can be released, do this here
-						writingTransactions = transaction->next;
-						PrependTransaction(&freeTransactions, transaction);
-
-						// If there is more data to write on this connection, do it sometime soon
-						NetworkTransaction *nextWrite = transaction->nextWrite;
-						if (nextWrite != nullptr)
+						if (transaction->next != nullptr)
 						{
-							PrependTransaction(&writingTransactions, nextWrite);
+							// Data is supposed to be sent and the last packet has been acknowledged.
+							// Rotate the transactions so every client is served even while multiple files are sent
+							NetworkTransaction *next = transaction->next;
+							writingTransactions = next;
+							AppendTransaction(&writingTransactions, transaction);
+							transaction = next;
+						}
+
+						if (transaction->Send())
+						{
+							// This transaction can be released, do this here
+							writingTransactions = transaction->next;
+							PrependTransaction(&freeTransactions, transaction);
+
+							// If there is more data to write on this connection, do it sometime soon
+							NetworkTransaction *nextWrite = transaction->nextWrite;
+							if (nextWrite != nullptr)
+							{
+								PrependTransaction(&writingTransactions, nextWrite);
+							}
 						}
 					}
 				}
@@ -506,7 +532,6 @@ void Network::Spin(bool full)
 
 		UnlockLWIP();
 	}
-	platform.ClassReport(longWait);
 	webserver->Spin();
 }
 
@@ -524,7 +549,7 @@ void Network::Diagnostics(MessageType mtype)
 	platform.Message(mtype, "=== Network ===\n");
 
 	size_t numFreeConnections = 0;
-	ConnectionState *freeConn = freeConnections;
+	const ConnectionState *freeConn = freeConnections;
 	while (freeConn != nullptr)
 	{
 		numFreeConnections++;
@@ -533,7 +558,7 @@ void Network::Diagnostics(MessageType mtype)
 	platform.MessageF(mtype, "Free connections: %d of %d\n", numFreeConnections, MEMP_NUM_TCP_PCB);
 
 	size_t numFreeTransactions = 0;
-	NetworkTransaction *freeTrans = freeTransactions;
+	const NetworkTransaction *freeTrans = freeTransactions;
 	while (freeTrans != nullptr)
 	{
 		numFreeTransactions++;
@@ -561,10 +586,10 @@ void Network::ResetCallback()
 // Called when data has been received. Return false if we cannot process it
 bool Network::ReceiveInput(pbuf *pb, ConnectionState* cs)
 {
-	NetworkTransaction* r = freeTransactions;
+	NetworkTransaction* const r = freeTransactions;
 	if (r == nullptr)
 	{
-		platform.Message(HOST_MESSAGE, "Network::ReceiveInput() - no free transactions!\n");
+		platform.Message(UsbMessage, "Network::ReceiveInput() - no free transactions!\n");
 		return false;
 	}
 
@@ -580,17 +605,17 @@ bool Network::ReceiveInput(pbuf *pb, ConnectionState* cs)
 // or NULL if no more items are available. This would reset the connection immediately
 ConnectionState *Network::ConnectionAccepted(tcp_pcb *pcb)
 {
-	ConnectionState *cs = freeConnections;
+	ConnectionState * const cs = freeConnections;
 	if (cs == nullptr)
 	{
-		platform.Message(HOST_MESSAGE, "Network::ConnectionAccepted() - no free ConnectionStates!\n");
+		platform.Message(UsbMessage, "Network::ConnectionAccepted() - no free ConnectionStates!\n");
 		return nullptr;
 	}
 
-	NetworkTransaction* transaction = freeTransactions;
+	NetworkTransaction* const transaction = freeTransactions;
 	if (transaction == nullptr)
 	{
-		platform.Message(HOST_MESSAGE, "Network::ConnectionAccepted() - no free transactions!\n");
+		platform.Message(UsbMessage, "Network::ConnectionAccepted() - no free transactions!\n");
 		return nullptr;
 	}
 
@@ -723,7 +748,7 @@ bool Network::ConnectionClosedGracefully(ConnectionState *cs)
 	NetworkTransaction *transaction = freeTransactions;
 	if (transaction == nullptr)
 	{
-		platform.Message(HOST_MESSAGE, "Network::ConnectionClosedGracefully() - no free transactions!\n");
+		platform.Message(UsbMessage, "Network::ConnectionClosedGracefully() - no free transactions!\n");
 		return false;
 	}
 
@@ -759,7 +784,7 @@ void Network::Unlock()
 	UnlockLWIP();
 }
 
-bool Network::InLwip() const
+bool Network::InNetworkStack() const
 {
 	return lwipLocked;
 }
@@ -769,7 +794,7 @@ const uint8_t *Network::GetIPAddress() const
 	return ethernet_get_ipaddress();
 }
 
-void Network::SetIPAddress(const uint8_t ipAddress[], const uint8_t netmask[], const uint8_t gateway[])
+void Network::SetEthernetIPAddress(IPAddress ipAddress, IPAddress netmask, IPAddress gateway)
 {
 	if (state == NetworkObtainingIP || state == NetworkActive)
 	{
@@ -803,16 +828,26 @@ void Network::SetHostname(const char *name)
 	else
 	{
 		// Don't allow empty hostnames
-		strcpy(hostname, HOSTNAME);
+		strcpy(hostname, DEFAULT_HOSTNAME);
 	}
 
+#if SUPPORT_MDNS
 	if (state == NetworkActive)
 	{
 		mdns_update_hostname();
 	}
+#endif
 }
 
-void Network::Enable(int mode, StringRef& reply)
+void Network::SetMacAddress(unsigned int interface, const uint8_t mac[])
+{
+	for (size_t i = 0; i < 6; i++)
+	{
+		macAddress[i] = mac[i];
+	}
+}
+
+GCodeResult Network::EnableInterface(unsigned int interface, int mode, const StringRef& ssid, const StringRef& reply)
 {
 	if (mode != 0)
 	{
@@ -830,17 +865,16 @@ void Network::Enable(int mode, StringRef& reply)
 			Stop();
 		}
 	}
+	return GCodeResult::ok;
 }
 
 // Get the network state into the reply buffer, returning true if there is some sort of error
-bool Network::GetNetworkState(StringRef& reply)
+GCodeResult Network::GetNetworkState(unsigned int interface, const StringRef& reply)
 {
-	const uint8_t * const config_ip = platform.GetIPAddress();
-	const uint8_t * const ipAddress = ethernet_get_ipaddress();
-	reply.printf("Network is %s, configured IP address: %u.%u.%u.%u, actual IP address: %u.%u.%u.%u",
-		(isEnabled) ? "enabled" : "disabled",
-					config_ip[0], config_ip[1], config_ip[2], config_ip[3], ipAddress[0], ipAddress[1], ipAddress[2], ipAddress[3]);
-	return false;
+	reply.printf("Network is %s, configured IP address: %s, actual IP address: %s",
+					(isEnabled) ? "enabled" : "disabled",
+						IP4String(platform.GetIPAddress()).c_str(), IP4String(ethernet_get_ipaddress()).c_str());
+	return GCodeResult::ok;
 }
 
 void Network::Activate()
@@ -857,7 +891,7 @@ void Network::Start()
 	if (state == NotStarted)
 	{
 		// Allow the MAC address to be set only before LwIP is started...
-		ethernet_configure_interface(platform.MACAddress(), hostname);
+		ethernet_configure_interface(macAddress, hostname);
 		init_ethernet();
 		netbios_init();
 		state = NetworkInactive;
@@ -1056,7 +1090,7 @@ bool Network::AcquireTransaction(ConnectionState *cs)
 	NetworkTransaction *acquiredTransaction = freeTransactions;
 	if (acquiredTransaction == nullptr)
 	{
-		platform.Message(HOST_MESSAGE, "Network: Could not acquire free transaction!\n");
+		platform.Message(UsbMessage, "Network: Could not acquire free transaction!\n");
 		return false;
 	}
 	freeTransactions = acquiredTransaction->next;

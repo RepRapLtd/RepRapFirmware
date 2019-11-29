@@ -161,16 +161,20 @@ Licence: GPL
 ****************************************************************************************************/
 
 #include "RepRapFirmware.h"
-
 #include "MessageType.h"
 #include "Platform.h"
 #include "RepRap.h"
+
+#ifdef RTOS
+# include "FreeRTOS.h"
+# include "task.h"
+#endif
 
 // We just need one instance of RepRap; everything else is contained within it and hidden
 
 RepRap reprap;
 
-const char *moduleName[] =
+const char * const moduleName[] =
 {
 	"Platform",
 	"Network",
@@ -183,108 +187,94 @@ const char *moduleName[] =
 	"Scanner",
 	"PrintMonitor",
 	"Storage",
-	"?","?","?","?",
+	"PortControl",
+	"DuetExpansion",
+	"FilamentSensors",
+	"WiFi",
+	"Display",
 	"none"
 };
+
+// class MillisTimer members
+
+// Start or restart the timer
+void MillisTimer::Start()
+{
+	whenStarted = millis();
+	running = true;
+}
+
+// Check whether the timer is running and a timeout has expired, but don't stop it
+bool MillisTimer::Check(uint32_t timeoutMillis) const
+{
+	return running && millis() - whenStarted >= timeoutMillis;
+}
+
+// Check whether a timeout has expired and stop the timer if it has, else leave it running if it was running
+bool MillisTimer::CheckAndStop(uint32_t timeoutMillis)
+{
+	const bool ret = Check(timeoutMillis);
+	if (ret)
+	{
+		running = false;
+	}
+	return ret;
+}
 
 //*************************************************************************************************
 
 // Utilities and storage not part of any class
 
-static char scratchStringBuffer[170];		// this needs to be long enough to print delta parameters and 18 words of stack (162 bytes)
-StringRef scratchString(scratchStringBuffer, ARRAY_SIZE(scratchStringBuffer));
-
 // For debug use
 void debugPrintf(const char* fmt, ...)
 {
-	va_list vargs;
-	va_start(vargs, fmt);
-	reprap.GetPlatform().MessageF(DEBUG_MESSAGE, fmt, vargs);
-	va_end(vargs);
-}
-
-// String testing
-
-bool StringEndsWith(const char* string, const char* ending)
-{
-	int j = strlen(string);
-	int k = strlen(ending);
-	return k <= j && StringEquals(&string[j - k], ending);
-}
-
-bool StringEquals(const char* s1, const char* s2)
-{
-	int i = 0;
-	while(s1[i] && s2[i])
+	// Calls to debugPrintf() from with ISRs are unsafe, both because of timing issues and because the call to Platform::MessageF tries to acquire a mutex.
+	// So ignore the call if we are coming from within an ISR.
+	if (!inInterrupt())
 	{
-		if(tolower(s1[i]) != tolower(s2[i]))
-		{
-			return false;
-		}
-		i++;
+		va_list vargs;
+		va_start(vargs, fmt);
+		reprap.GetPlatform().MessageF(DebugMessage, fmt, vargs);
+		va_end(vargs);
 	}
-
-	return !(s1[i] || s2[i]);
 }
 
-bool StringStartsWith(const char* string, const char* starting)
+#ifdef RTOS
+
+void delay(uint32_t ms)
 {
-	int j = strlen(string);
-	int k = strlen(starting);
-	if (k > j)
+	vTaskDelay(ms);
+}
+
+#endif
+
+// Convert a float to double for passing to printf etc. If it is a NaN or infinity, convert it to 9999.9 to avoid getting JSON parse errors.
+double HideNan(float val)
+{
+	return (double)((std::isnan(val) || std::isinf(val)) ? 9999.9 : val);
+}
+
+// Append a list of driver numbers to a string, with a space before each one
+void ListDrivers(const StringRef& str, DriversBitmap drivers)
+{
+	for (unsigned int d = 0; drivers != 0; ++d)
 	{
-		return false;
+		if ((drivers & 1) != 0)
+		{
+			str.catf(" %u", d);
+		}
+		drivers >>= 1;
 	}
+}
 
-	for(int i = 0; i < k; i++)
+// Convert a PWM that is possibly in the old style 0..255 to be in the range 0.0..1.0
+float ConvertOldStylePwm(float v)
+{
+	if (v > 1.0)
 	{
-		if (string[i] != starting[i])
-		{
-			return false;
-		}
+		v = v/255.0;
 	}
-
-	return true;
-}
-
-int StringContains(const char* string, const char* match)
-{
-	int i = 0;
-	int count = 0;
-
-	while(string[i])
-	{
-		if (string[i++] == match[count])
-		{
-			count++;
-			if (!match[count])
-			{
-				return i;
-			}
-		}
-		else
-		{
-			count = 0;
-		}
-	}
-
-	return -1;
-}
-
-// Version of strncpy that ensures the result is null terminated
-void SafeStrncpy(char *dst, const char *src, size_t length)
-{
-	strncpy(dst, src, length);
-	dst[length - 1] = 0;
-}
-
-// Version of strcat that takes the original buffer size as the limit and ensures the result is null terminated
-void SafeStrncat(char *dst, const char *src, size_t length)
-{
-	dst[length - 1] = 0;
-	const size_t index = strlen(dst);
-	strncat(dst + index, src, length - index);
-	dst[length - 1] = 0;
+	return constrain<float>(v, 0.0, 1.0);
 }
 
 // End
